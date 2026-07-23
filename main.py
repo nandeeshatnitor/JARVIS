@@ -28,36 +28,36 @@ from pathlib import Path
 import sounddevice as sd
 from google import genai
 from google.genai import types
-from JARVIS.ui import JarvisUI
-from JARVIS.memory.memory_manager import (
+from ui import JarvisUI
+from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
 
-from JARVIS.actions.file_processor import file_processor
-from JARVIS.actions.flight_finder     import flight_finder
-from JARVIS.actions.open_app          import open_app
-from JARVIS.actions.weather_report    import weather_action
-from JARVIS.actions.send_message      import send_message
-from JARVIS.actions.reminder          import reminder
-from JARVIS.actions.computer_settings import computer_settings
-from JARVIS.actions.screen_processor  import _capture_camera, _capture_screen
-from JARVIS.actions.youtube_video     import youtube_video
-from JARVIS.actions.desktop           import desktop_control
-from JARVIS.actions.browser_control   import browser_control
-from JARVIS.actions.file_controller   import file_controller
-from JARVIS.actions.code_helper       import code_helper
-from JARVIS.actions.dev_agent         import dev_agent
-from JARVIS.actions.web_search        import web_search as web_search_action
-from JARVIS.actions.computer_control  import computer_control
-from JARVIS.actions.game_updater      import game_updater
-from JARVIS.actions.system_monitor    import SystemMonitor, get_system_status
-from JARVIS.actions.proactive         import ProactiveEngine
-from JARVIS.actions.web_search        import _news as _fetch_news_sync
-from JARVIS.actions.email             import email_action
-from JARVIS.memory.config_manager     import get_brief_enabled
+from actions.file_processor import file_processor
+from actions.flight_finder     import flight_finder
+from actions.open_app          import open_app
+from actions.weather_report    import weather_action
+from actions.send_message      import send_message
+from actions.reminder          import reminder
+from actions.computer_settings import computer_settings
+from actions.screen_processor  import _capture_camera, _capture_screen
+from actions.youtube_video     import youtube_video
+from actions.desktop           import desktop_control
+from actions.browser_control   import browser_control
+from actions.file_controller   import file_controller
+from actions.code_helper       import code_helper
+from actions.dev_agent         import dev_agent
+from actions.web_search        import web_search as web_search_action
+from actions.computer_control  import computer_control
+from actions.game_updater      import game_updater
+from actions.system_monitor    import SystemMonitor, get_system_status
+from actions.proactive         import ProactiveEngine
+from actions.web_search        import _news as _fetch_news_sync
+from actions.email             import email_action
+from memory.config_manager     import get_brief_enabled
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-from JARVIS.core.logging_config import setup_logging, get_logger
+from core.logging_config import setup_logging, get_logger
 setup_logging()
 log = get_logger(__name__)
 
@@ -852,11 +852,11 @@ class JarvisLive:
                 instructions = args.get("instructions", "")
 
                 if action == "auth":
-                    from JARVIS.actions.email import force_reauth
+                    from actions.email import force_reauth
                     force_reauth()
                     result = "Re-authentication triggered. Next email action will open browser for OAuth."
                 elif action == "status":
-                    from JARVIS.actions.email import get_gmail_service
+                    from actions.email import get_gmail_service
                     try:
                         get_gmail_service()
                         result = "✅ Gmail API authenticated and ready."
@@ -1309,7 +1309,7 @@ class JarvisLive:
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
-            from JARVIS.dashboard.server import DashboardServer
+            from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
             asyncio.create_task(self._dashboard.serve())

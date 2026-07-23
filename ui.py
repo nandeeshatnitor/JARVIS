@@ -1864,7 +1864,7 @@ class MainWindow(QMainWindow):
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
         self._update_autostart_btn(self._check_autostart())
-        from JARVIS.memory.config_manager import get_brief_enabled as _gbe
+        from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
 
         self._clock_tmr = QTimer(self)
@@ -3073,7 +3073,7 @@ class MainWindow(QMainWindow):
             """)
 
     def _toggle_brief(self):
-        from JARVIS.memory.config_manager import get_brief_enabled, save_brief_enabled
+        from memory.config_manager import get_brief_enabled, save_brief_enabled
         new_val = not get_brief_enabled()
         save_brief_enabled(new_val)
         self._update_brief_btn(new_val)

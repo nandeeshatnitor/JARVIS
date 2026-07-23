@@ -1,5 +1,5 @@
 """
-Centralized logging configuration for JARVIS.
+Centralized logging configuration for JARVIS .
 All logs go to logs/jarvis.log with rotation, and critical logs also print to console.
 Terminal stdout/stderr are also captured to logs/terminal.log
 """
@@ -8,7 +8,7 @@ import logging
 import logging.handlers
 import sys
 import io
-from JARVIS.core.llm_client import get_base_dir
+from core.llm_client import get_base_dir
 
 BASE_DIR = get_base_dir()
 LOG_DIR = BASE_DIR / "logs"

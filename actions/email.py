@@ -36,8 +36,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import BatchHttpRequest
 
-from JARVIS.core.llm_client import call_llm
-from JARVIS.memory.config_manager import (
+from core.llm_client import call_llm
+from memory.config_manager import (
     CONFIG_DIR,
     load_api_keys,
     get_user_email,
