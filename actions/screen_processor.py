@@ -317,7 +317,7 @@ class _VisionSession:
                     },
                     turn_complete=True,
                 )
-                print(f"[Vision] 📤 Sent {len(image_bytes):,} bytes — '{user_text[:60]}'")
+                print(f"[Vision] 📤 Sent {len(image_bytes):,} bytes — '{user_text}'")
             except Exception as e:
                 print(f"[Vision] ⚠️  Send error: {e}")
                 raise  # propagate to TaskGroup → triggers session reconnect

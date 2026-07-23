@@ -54,6 +54,13 @@ from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
+from actions.email             import email_action
+from memory.config_manager     import get_brief_enabled
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+from core.logging_config import setup_logging, get_logger
+setup_logging()
+log = get_logger(__name__)
 
 
 def get_base_dir():
@@ -517,6 +524,36 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "email",
+        "description": (
+            "Manages email via Gmail API. Actions: fetch (get unread emails), process (fetch + AI reply drafts), "
+            "auth (run OAuth flow), status (check auth status). Creates draft replies for human review — "
+            "does NOT send emails directly. Use 'fetch' to see recent unread, 'process' to generate AI replies."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "fetch | process | auth | status (default: fetch)"
+                },
+                "max_results": {
+                    "type": "INTEGER",
+                    "description": "Max emails to fetch (default: 10, max: 50)"
+                },
+                "days_back": {
+                    "type": "INTEGER",
+                    "description": "Days back to search (default: 7)"
+                },
+                "instructions": {
+                    "type": "STRING",
+                    "description": "Custom instructions for AI reply generation"
+                },
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 # --- Plugin system ---
@@ -595,7 +632,7 @@ class JarvisLive:
                 except Exception:
                     break
             if drained:
-                print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+                log.info(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -625,9 +662,11 @@ class JarvisLive:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
             self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
-        except Exception:
+            log.debug(f"Fetched username is {_user_name}")
+        except Exception as e:
             self._asst_name = "JARVIS"
-            _user_name = ""
+            _user_name = "Dr. Stark"
+            log.warning(f"Username exception: {e}")
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
@@ -694,7 +733,7 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        log.info(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
         if name == "save_memory":
@@ -703,7 +742,7 @@ class JarvisLive:
             value    = args.get("value", "")
             if key and value:
                 update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                log.debug(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
@@ -749,7 +788,7 @@ class JarvisLive:
                 _cooldown = 4.0  # seconds — covers echo window after speaking ends
                 if self._vision_busy or (_now - self._vision_last_time) < _cooldown:
                     _wait = max(0, _cooldown - (_now - self._vision_last_time))
-                    print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
+                    log.debug(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
                     self._vision_busy      = True
@@ -760,11 +799,11 @@ class JarvisLive:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
                         self.ui.start_camera_stream()
                         self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                        log.debug(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
                         _stall = "camera"
                     else:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
+                        log.debug(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
                         _stall = "screen"
                     self._pending_vision = (img_b, mime_t, user_text, angle)
                     result = (
@@ -823,6 +862,38 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
+
+            elif name == "email":
+                action = args.get("action", "fetch")
+                max_results = args.get("max_results", 10)
+                days_back = args.get("days_back", 7)
+                instructions = args.get("instructions", "")
+
+                if action == "auth":
+                    from actions.email import force_reauth
+                    force_reauth()
+                    result = "Re-authentication triggered. Next email action will open browser for OAuth."
+                elif action == "status":
+                    from actions.email import get_gmail_service
+                    try:
+                        get_gmail_service()
+                        result = "✅ Gmail API authenticated and ready."
+                    except Exception as e:
+                        result = f"❌ Gmail API not authenticated: {e}"
+                else:
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: email_action(
+                            parameters={
+                                "action": action,
+                                "max_results": max_results,
+                                "days_back": days_back,
+                                "instructions": instructions,
+                            },
+                            player=self.ui,
+                        )
+                    )
+                    result = r or "Done."
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
@@ -963,7 +1034,7 @@ class JarvisLive:
                                 img_b, mime_t, question, angle = self._pending_vision
                                 self._pending_vision = None
                                 b64 = _b64.b64encode(img_b).decode("ascii")
-                                print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
+                                log.debug(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
                                 await self.session.send_client_content(
                                     turns={"parts": [
                                         {"inline_data": {"mime_type": mime_t, "data": b64}},
@@ -991,19 +1062,19 @@ class JarvisLive:
                     if response.tool_call:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
+                            log.debug(f"[JARVIS] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
+            log.error(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
             raise
 
     async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
+        log.info("[JARVIS] 🔊 Play started")
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
@@ -1035,7 +1106,7 @@ class JarvisLive:
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
+            log.error(f"[JARVIS] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
@@ -1139,7 +1210,7 @@ class JarvisLive:
                 )
                 self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
             except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
+                log.error(f"[Briefing] Phase 2 error: {e}")
                 self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
 
         asyncio.create_task(_deliver_news())
@@ -1158,7 +1229,7 @@ class JarvisLive:
                         turn_complete=True,
                     )
                 except Exception as e:
-                    print(f"[Monitor] ⚠️ Could not send alert: {e}")
+                    log.warning(f"[Monitor] ⚠️ Could not send alert: {e}")
 
     # ── Proactive mode ──────────────────────────────────────────────────────────
 
@@ -1193,7 +1264,7 @@ class JarvisLive:
                 )
                 self.ui.write_log("SYS: Proactive check-in.")
             except Exception as e:
-                print(f"[Proactive] ⚠️ {e}")
+                log.warning(f"[Proactive] ⚠️ {e}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -1242,11 +1313,11 @@ class JarvisLive:
                     )
                     self.ui.write_log(f"[Web]: {text}")
                 else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                    log.warning(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
-                print(f"[Dashboard] Command error: {e}")
+                log.error(f"[Dashboard] Command error: {e}")
                 await asyncio.sleep(0.5)
 
     # ── main loop ───────────────────────────────────────────────────────────

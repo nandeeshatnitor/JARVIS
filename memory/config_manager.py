@@ -109,3 +109,38 @@ def save_vad_silence_timeout_ms(timeout_ms: int) -> None:
             data = {}
     data["vad_silence_timeout_ms"] = int(timeout_ms)
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+def get_user_email() -> str:
+    """Return the configured user email for Gmail API."""
+    return load_api_keys().get("user_email", "")
+
+
+def save_user_email(email: str) -> None:
+    """Save user email to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["user_email"] = email.strip().lower()
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_user_context() -> str:
+    """Return the configured user context for AI email replies."""
+    return load_api_keys().get("user_context", "")
+
+
+def save_user_context(context: str) -> None:
+    """Save user context to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["user_context"] = context.strip()
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")

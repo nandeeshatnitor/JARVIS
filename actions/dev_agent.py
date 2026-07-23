@@ -573,7 +573,7 @@ def _build_project(
         f"Project is saved at {project_dir} — open it in VSCode and check manually."
     )
     if speak: speak(msg)
-    return f"{msg}\n\nLast error:\n{last_output[:600]}"
+    return f"{msg}\n\nLast error:\n{last_output}"
 
 
 def dev_agent(

@@ -1,3 +1,7 @@
 .claude/*
 .jarvis/*
-config/*
+*.pyc
+!config/*.py
+config
+*.vsix
+logs/*

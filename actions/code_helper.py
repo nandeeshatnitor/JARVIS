@@ -405,7 +405,7 @@ Optimize the following code for:
 Return ONLY the optimized code — no explanation, no markdown, no backticks.
 
 Original code:
-{code[:6000]}
+{code}
 
 Optimized code:"""
 

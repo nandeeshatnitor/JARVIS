@@ -158,7 +158,7 @@ def _type(text: str, interval: float = 0.03) -> str:
     _require_pyautogui()
     time.sleep(0.3)
     pyautogui.typewrite(text, interval=interval)
-    return f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}"
+    return f"Typed: {text}"
 
 
 def _smart_type(text: str, clear_first: bool = True) -> str:
@@ -172,10 +172,10 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
         time.sleep(0.1)
         paste_key = "command" if _get_os() == "mac" else "ctrl"
         pyautogui.hotkey(paste_key, "v")
-        return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
+        return f"Smart-typed (clipboard): {text}"
 
     pyautogui.typewrite(text, interval=0.04)
-    return f"Smart-typed: {text[:60]}{'…' if len(text) > 60 else ''}"
+    return f"Smart-typed: {text}"
 
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
@@ -235,7 +235,7 @@ def _clipboard_paste(text: str) -> str:
         _require_pyautogui()
         paste_key = "command" if _get_os() == "mac" else "ctrl"
         pyautogui.hotkey(paste_key, "v")
-        return f"Pasted: {text[:60]}{'…' if len(text) > 60 else ''}"
+        return f"Pasted: {text}"
     return "pyperclip not available"
 
 

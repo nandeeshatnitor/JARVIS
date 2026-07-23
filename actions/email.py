@@ -1,0 +1,1039 @@
+"""
+Email Module for JARVIS Assistant
+
+API-driven email module for Gmail API (Google) with OAuth 2.0 authentication.
+Supports fetching unread emails, AI-powered reply generation, and draft creation.
+Does NOT send emails directly — creates drafts for human review.
+
+Setup:
+1. Go to Google Cloud Console (https://console.cloud.google.com/)
+2. Create a new project or select existing
+3. Enable Gmail API: APIs & Services > Library > Gmail API > Enable
+4. Create OAuth 2.0 credentials: APIs & Services > Credentials > Create Credentials > OAuth Client ID
+   - Application type: Desktop Application
+   - Authorized redirect URIs: http://localhost:8080/ (or use the default http://localhost)
+5. Download credentials JSON and save as config/gmail_credentials.json
+6. On first run, JARVIS will open a browser for OAuth consent and store tokens securely
+"""
+
+import base64
+import json
+import os
+import sys
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from email.message import EmailMessage # type: ignore
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Any, Optional, List
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import BatchHttpRequest
+
+from core.llm_client import call_llm
+from memory.config_manager import (
+    CONFIG_DIR,
+    load_api_keys,
+    get_user_email,
+    get_user_context,
+)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ───────────────────────────────────────────────────────────────────────────────
+
+# Gmail API scopes — modify if you need different permissions
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",  # For creating drafts
+    "https://www.googleapis.com/auth/gmail.modify",   # For marking as read
+]
+
+# File paths
+CREDENTIALS_FILE = CONFIG_DIR / "gmail_credentials.json"
+TOKEN_FILE = CONFIG_DIR / "gmail_token.json"
+
+# Rate limiting
+MAX_EMAILS_PER_FETCH = 20
+RATE_LIMIT_DELAY = 1.0  # seconds between API calls
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # exponential backoff base
+
+# Email fetch defaults
+DEFAULT_MAX_RESULTS = 10
+DEFAULT_DAYS_BACK = 7
+# ───────────────────────────────────────────────────────────────────────────────
+# Data Classes
+# ───────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class EmailMessage:
+    """Clean email data structure with extracted metadata and plain-text body."""
+    id: str
+    thread_id: str
+    sender: str
+    recipient: str
+    subject: str
+    date: datetime
+    snippet: str
+    body_text: str
+    is_unread: bool
+    labels: list[str]
+    references: str = ""
+@dataclass
+class DraftReply:
+    """Draft reply ready for user review."""
+    thread_id: str
+    to: str
+    subject: str
+    body: str
+    in_reply_to: str
+    references: str
+# ───────────────────────────────────────────────────────────────────────────────
+# Exceptions
+# ───────────────────────────────────────────────────────────────────────────────
+
+class EmailError(Exception):
+    """Base exception for email module errors."""
+    pass
+class AuthenticationError(EmailError):
+    """Authentication/authorization failure."""
+    pass
+class RateLimitError(EmailError):
+    """API rate limit exceeded."""
+    pass
+class NetworkError(EmailError):
+    """Network/connectivity issues."""
+    pass
+class TokenExpiredError(AuthenticationError):
+    """OAuth token expired and refresh failed."""
+    pass
+# ───────────────────────────────────────────────────────────────────────────────
+# Token Storage
+# ───────────────────────────────────────────────────────────────────────────────
+
+def _load_token() -> Optional[Credentials]:
+    """Load OAuth credentials from secure token file."""
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        creds = Credentials.from_authorized_user_info(data, GMAIL_SCOPES)
+        return creds
+    except Exception as e:
+        print(f"[Email] ⚠️ Failed to load token: {e}")
+        return None
+def _save_token(creds: Credentials) -> None:
+    """Save OAuth credentials to secure token file."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+        "expiry": creds.expiry.isoformat() if creds.expiry else None,
+    }
+    TOKEN_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Restrict file permissions on Unix-like systems
+    try:
+        TOKEN_FILE.chmod(0o600)
+    except Exception:
+        pass  # Windows ignores chmod
+def _delete_token() -> None:
+    """Delete stored token (force re-auth)."""
+    if TOKEN_FILE.exists():
+        TOKEN_FILE.unlink()
+# ───────────────────────────────────────────────────────────────────────────────
+# Authentication
+# ───────────────────────────────────────────────────────────────────────────────
+
+def get_gmail_service() -> Any:
+    """
+    Get authenticated Gmail API service.
+    Handles OAuth flow, token refresh, and secure storage.
+    """
+    creds = _load_token()
+
+    # No valid credentials — run OAuth flow
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                print("[Email] 🔄 Refreshing expired token...")
+                creds.refresh(Request())
+                _save_token(creds)
+                print("[Email] ✅ Token refreshed")
+            except Exception as e:
+                print(f"[Email] ❌ Token refresh failed: {e}")
+                _delete_token()
+                creds = None
+
+        if not creds:
+            creds = _run_oauth_flow()
+            if not creds:
+                raise AuthenticationError("OAuth flow failed or was cancelled")
+            _save_token(creds)
+            print("[Email] ✅ New credentials saved")
+
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+def _run_oauth_flow() -> Optional[Credentials]:
+    """Run OAuth 2.0 authorization flow for desktop app."""
+    if not CREDENTIALS_FILE.exists():
+        raise AuthenticationError(
+            f"Gmail credentials not found at {CREDENTIALS_FILE}.\n"
+            "Please download OAuth credentials from Google Cloud Console and save as "
+            "config/gmail_credentials.json. See module docstring for setup instructions."
+        )
+
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(CREDENTIALS_FILE),
+            GMAIL_SCOPES,
+        )
+        # Run local server on port 8080 for OAuth callback
+        creds = flow.run_local_server(port=8080, access_type="offline", prompt="consent")
+        return creds
+    except Exception as e:
+        print(f"[Email] ❌ OAuth flow failed: {e}")
+        traceback.print_exc()
+        return None
+def force_reauth() -> None:
+    """Force re-authentication by deleting stored token."""
+    _delete_token()
+    print("[Email] 🔐 Token deleted — next operation will require re-authentication")
+# ───────────────────────────────────────────────────────────────────────────────
+# Email Parsing Utilities
+# ───────────────────────────────────────────────────────────────────────────────
+
+def _decode_base64url(data: str) -> bytes:
+    """Decode base64url-encoded string (Gmail API format)."""
+    # Add padding if needed
+    padding = 4 - (len(data) % 4)
+    if padding != 4:
+        data += "=" * padding
+    return base64.urlsafe_b64decode(data)
+def _extract_body(payload: dict) -> str:
+    """
+    Recursively extract plain-text body from Gmail message payload.
+    Prefers text/plain over text/html, strips HTML if only HTML available.
+    """
+    if not payload:
+        return ""
+
+    mime_type = payload.get("mimeType", "")
+    body = payload.get("body", {})
+    data = body.get("data", "")
+
+    # Leaf node with content
+    if data:
+        try:
+            decoded = _decode_base64url(data).decode("utf-8", errors="replace")
+            if mime_type == "text/plain":
+                return decoded
+            elif mime_type == "text/html":
+                return _strip_html(decoded)
+        except Exception:
+            pass
+
+    # Multipart — recurse into parts
+    parts = payload.get("parts", [])
+    for part in parts:
+        part_text = _extract_body(part)
+        if part_text:
+            # Prefer plain text
+            if part.get("mimeType") == "text/plain":
+                return part_text
+
+    # Fallback: return first non-empty part (likely HTML)
+    for part in parts:
+        part_text = _extract_body(part)
+        if part_text:
+            return part_text
+
+    return ""
+def _strip_html(html: str) -> str:
+    """Convert HTML to clean plain text."""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove script/style elements
+        for tag in soup(["script", "style", "head", "meta", "link", "noscript"]):
+            tag.decompose()
+
+        # Get text with reasonable formatting
+        text = soup.get_text(separator="\n", strip=True)
+
+        # Clean up excessive whitespace
+        lines = [line.strip() for line in text.split("\n")]
+        lines = [line for line in lines if line]
+        return "\n".join(lines)
+    except Exception:
+        # Fallback: crude tag stripping
+        import re
+        text = re.sub(r"<[^>]+>", "", html)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+def _parse_email_date(date_str: str) -> datetime:
+    """Parse Gmail date header to datetime."""
+    # Gmail format: "Wed, 15 Jan 2025 14:30:00 +0000"
+    try:
+        return datetime.strptime(date_str[:31], "%a, %d %b %Y %H:%M:%S")
+    except Exception:
+        try:
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.now()
+def _extract_header(headers: list[dict], name: str) -> str:
+    """Extract header value by name (case-insensitive)."""
+    name_lower = name.lower()
+    for h in headers:
+        if h.get("name", "").lower() == name_lower:
+            return h.get("value", "")
+    return ""
+def _parse_gmail_message(msg: dict) -> EmailMessage:
+    """Parse Gmail API message response into EmailMessage."""
+    payload = msg.get("payload", {})
+    headers = payload.get("headers", [])
+
+    # Extract headers
+    subject = _extract_header(headers, "Subject")
+    sender = _extract_header(headers, "From")
+    recipient = _extract_header(headers, "To")
+    date_str = _extract_header(headers, "Date")
+    message_id = _extract_header(headers, "Message-ID")
+    references = _extract_header(headers, "References")
+
+    # Parse date
+    date = _parse_email_date(date_str)
+
+    # Extract body
+    body_text = _extract_body(payload)
+
+    # Labels and unread status
+    labels = msg.get("labelIds", [])
+    is_unread = "UNREAD" in labels
+
+    return EmailMessage(
+        id=msg.get("id", ""),
+        thread_id=msg.get("threadId", ""),
+        sender=sender,
+        recipient=recipient,
+        subject=subject or "(No Subject)",
+        date=date,
+        snippet=msg.get("snippet", ""),
+        body_text=body_text.strip(),
+        is_unread=is_unread,
+        labels=labels,
+        references=references,
+    )
+# ───────────────────────────────────────────────────────────────────────────────
+# API Operations with Retry Logic
+# ───────────────────────────────────────────────────────────────────────────────
+
+def _execute_with_retry(request, retries: int = MAX_RETRIES) -> Any:
+    """Execute API request with exponential backoff for rate limits and network errors."""
+    for attempt in range(retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = e.resp.status
+            if status == 429:  # Rate limit
+                wait = RATE_LIMIT_DELAY * (RETRY_BACKOFF ** attempt)
+                print(f"[Email] ⏳ Rate limited (429), waiting {wait:.1f}s (attempt {attempt + 1}/{retries})")
+                time.sleep(wait)
+                continue
+            elif status in (500, 502, 503, 504):  # Server errors
+                wait = RATE_LIMIT_DELAY * (RETRY_BACKOFF ** attempt)
+                print(f"[Email] ⏳ Server error {status}, waiting {wait:.1f}s (attempt {attempt + 1}/{retries})")
+                time.sleep(wait)
+                continue
+            elif status == 401:  # Unauthorized — token expired
+                raise TokenExpiredError("Authentication token expired or invalid")
+            elif status == 403:  # Forbidden — insufficient permissions
+                raise AuthenticationError(f"Insufficient permissions: {e}")
+            else:
+                raise EmailError(f"Gmail API error ({status}): {e}")
+        except (ConnectionError, TimeoutError) as e:
+            wait = RATE_LIMIT_DELAY * (RETRY_BACKOFF ** attempt)
+            print(f"[Email] ⏳ Network error: {e}, waiting {wait:.1f}s (attempt {attempt + 1}/{retries})")
+            time.sleep(wait)
+            continue
+        except Exception as e:
+            raise EmailError(f"Unexpected error: {e}")
+
+    raise EmailError(f"Max retries ({retries}) exceeded")
+# ───────────────────────────────────────────────────────────────────────────────
+# Core Email Operations
+# ───────────────────────────────────────────────────────────────────────────────
+
+def fetch_unread_emails(
+    max_results: int = DEFAULT_MAX_RESULTS,
+    days_back: int = DEFAULT_DAYS_BACK,
+    include_read: bool = False,
+    query: Optional[str] = None,
+) -> list[EmailMessage]:
+    """
+    Fetch recent emails from Gmail.
+
+    Args:
+        max_results: Maximum number of emails to fetch (default: 10, max: 100)
+        days_back: How many days back to search (default: 7)
+        include_read: If True, include read emails; if False, only unread
+        query: Custom Gmail search query (overrides other filters)
+
+    Returns:
+        List of EmailMessage objects sorted newest first
+    """
+    service = get_gmail_service()
+
+    # Build query
+    if query is None:
+        query_parts = []
+        if not include_read:
+            query_parts.append("is:unread")
+        if days_back > 0:
+            since_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y/%m/%d")
+            query_parts.append(f"after:{since_date}")
+        query = " ".join(query_parts) if query_parts else ""
+
+    print(f"[Email] 🔍 Fetching emails: query='{query}', max={max_results}")
+
+    # List messages
+    try:
+        list_req = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=min(max_results, MAX_EMAILS_PER_FETCH),
+        )
+        response = _execute_with_retry(list_req)
+    except HttpError as e:
+        if e.resp.status == 401:
+            raise TokenExpiredError("Authentication failed — token may be expired")
+        raise
+
+    messages = response.get("messages", [])
+    if not messages:
+        print("[Email] 📭 No messages found")
+        return []
+
+    print(f"[Email] 📬 Found {len(messages)} messages, fetching details...")
+
+    # Batch fetch full messages
+    emails = []
+    for i, msg_ref in enumerate(messages):
+        try:
+            get_req = service.users().messages().get(
+                userId="me",
+                id=msg_ref["id"],
+                format="full",
+            )
+            msg = _execute_with_retry(get_req)
+            email = _parse_gmail_message(msg)
+            emails.append(email)
+
+            # Small delay to respect rate limits
+            if i < len(messages) - 1:
+                time.sleep(RATE_LIMIT_DELAY)
+
+        except TokenExpiredError:
+            raise
+        except Exception as e:
+            print(f"[Email] ⚠️ Failed to fetch message {msg_ref['id']}: {e}")
+            continue
+
+    # Sort newest first
+    emails.sort(key=lambda e: e.date, reverse=True)
+    print(f"[Email] ✅ Fetched {len(emails)} emails")
+    return emails
+def mark_as_read(email_ids: list[str]) -> bool:
+    """Mark emails as read by removing UNREAD label."""
+    if not email_ids:
+        return True
+
+    service = get_gmail_service()
+    try:
+        batch = service.new_batch_http_request()
+        for msg_id in email_ids:
+            batch.add(
+                service.users().messages().modify(
+                    userId="me",
+                    id=msg_id,
+                    body={"removeLabelIds": ["UNREAD"]},
+                )
+            )
+        batch.execute()
+        print(f"[Email] ✅ Marked {len(email_ids)} emails as read")
+        return True
+    except Exception as e:
+        print(f"[Email] ⚠️ Failed to mark as read: {e}")
+        return False
+# ───────────────────────────────────────────────────────────────────────────────
+# AI Reply Generation
+# ───────────────────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT_EMAIL_REPLY = """You are JARVIS, an AI assistant drafting email replies for your user.
+Your task: Write a concise, professional, context-aware reply to the incoming email.
+
+Guidelines:
+- Match the tone of the incoming email (formal/casual, brief/detailed)
+- Address the sender by name if available
+- Answer questions directly; ask clarifying questions if needed
+- Keep replies concise — 2-5 sentences typically
+- Do NOT make up information; if unsure, say "I'll check and get back to you"
+- Sign off as the user would (use their name from context if known)
+- Output ONLY the reply body — no greetings like "Here's a draft:" or explanations
+
+Context about the user:
+- Name: {user_name}
+- Role/Context: {user_context}
+"""
+def generate_ai_reply(
+    email: EmailMessage,
+    user_name: str = "",
+    user_context: str = "",
+    custom_instructions: str = "",
+) -> str:
+    """
+    Generate a contextual AI reply for the given email.
+
+    Args:
+        email: The email to reply to
+        user_name: Your name for signing off
+        user_context: Brief context about you (role, projects, etc.)
+        custom_instructions: Additional instructions for the AI
+
+    Returns:
+        Plain-text reply body ready for draft creation
+    """
+    # Truncate very long emails to fit context window
+    max_body_len = 30000
+    body = email.body_text
+    if len(body) > max_body_len:
+        body = body[:max_body_len] + "\n\n[...truncated...]"
+
+    # Build prompt
+    prompt = f"""Incoming email:
+From: {email.sender}
+To: {email.recipient}
+Subject: {email.subject}
+Date: {email.date.strftime('%Y-%m-%d %H:%M')}
+---
+{body}
+
+---
+{custom_instructions}"""
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_EMAIL_REPLY.format(
+            user_name=user_name or "the user",
+            user_context=user_context or "General professional",
+        )},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        response = call_llm(messages, tools=None, timeout=60)
+        reply = response.get("content", "").strip()
+
+        # Clean up any AI meta-commentary
+        if reply.lower().startswith(("here is", "here's a", "draft:", "reply:")):
+            lines = reply.split("\n")
+            reply = "\n".join(lines[1:]).strip()
+
+        return reply
+    except Exception as e:
+        print(f"[Email] ❌ AI reply generation failed: {e}")
+        raise EmailError(f"Failed to generate AI reply: {e}")
+# ───────────────────────────────────────────────────────────────────────────────
+# Draft Creation
+# ───────────────────────────────────────────────────────────────────────────────
+
+def create_draft_reply(
+    email: EmailMessage,
+    reply_body: str,
+    user_email: str = "",
+) -> DraftReply:
+    """
+    Create a draft reply in Gmail (does NOT send).
+
+    Args:
+        email: Original email to reply to
+        reply_body: Plain-text reply content
+        user_email: Your email address (for From header)
+
+    Returns:
+        DraftReply object with draft details
+    """
+    service = get_gmail_service()
+
+    # Build reply message (use MIMEText to create proper email message)
+    message = MIMEText(reply_body)
+    message["To"] = email.sender
+    message["Subject"] = f"Re: {email.subject}" if not email.subject.lower().startswith("re:") else email.subject
+    message["In-Reply-To"] = email.id
+    message["References"] = f"{email.references} {email.id}".strip() if email.references else email.id
+
+    if user_email:
+        message["From"] = user_email
+
+    # Encode for Gmail API
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    # Create draft
+    draft_body = {
+        "message": {
+            "raw": raw,
+            "threadId": email.thread_id,
+        }
+    }
+
+    try:
+        req = service.users().drafts().create(userId="me", body=draft_body)
+        draft = _execute_with_retry(req)
+
+        print(f"[Email] ✅ Draft created for thread {email.thread_id}")
+        return DraftReply(
+            thread_id=email.thread_id,
+            to=email.sender,
+            subject=message["Subject"],
+            body=reply_body,
+            in_reply_to=email.id,
+            references=message["References"],
+        )
+    except HttpError as e:
+        if e.resp.status == 401:
+            raise TokenExpiredError("Authentication failed creating draft")
+        raise EmailError(f"Failed to create draft: {e}")
+# ───────────────────────────────────────────────────────────────────────────────
+# High-Level Workflow
+# ───────────────────────────────────────────────────────────────────────────────
+
+def process_unread_emails(
+    max_results: int = DEFAULT_MAX_RESULTS,
+    days_back: int = DEFAULT_DAYS_BACK,
+    user_name: str = "",
+    user_context: str = "",
+    user_email: str = "",
+    custom_instructions: str = "",
+    mark_read_after: bool = True,
+    target_email_ids: Optional[List[str]] = None,
+) -> list[dict]:
+    """
+    Complete workflow: fetch unread emails → generate AI replies → create drafts.
+
+    Args:
+        max_results: Max emails to process
+        days_back: How many days back to search
+        user_name: Your name for sign-off
+        user_context: Brief context about you
+        user_email: Your email address
+        custom_instructions: Additional AI instructions
+        mark_read_after: Mark processed emails as read
+        target_email_ids: List of specific email IDs to create drafts for (only these will be processed)
+
+    Returns:
+        List of result dicts with email info and draft status
+    """
+    results = []
+
+    # Load user config if not provided
+    if not user_name or not user_email:
+        config = load_api_keys()
+        user_name = user_name or config.get("user_name", "")
+        user_email = user_email or config.get("user_email", "")
+
+    try:
+        emails = fetch_unread_emails(max_results=max_results, days_back=days_back)
+    except TokenExpiredError:
+        raise
+    except Exception as e:
+        raise EmailError(f"Failed to fetch emails: {e}")
+
+    # Strict validation - filter emails if target_email_ids is provided
+    if target_email_ids is not None:
+        # Create a set for faster lookup
+        target_ids_set = set(target_email_ids)
+
+        # Filter emails to only those in the target list
+        emails = [email for email in emails if email.id in target_ids_set]
+
+        # Log the filtering activity
+        print(f"[Email] 🎯 Filtering: Found {len(emails)} matching emails out of {len(target_email_ids)} requested")
+        if emails:
+            print(f"[Email] 📧 Matching emails: {', '.join([e.subject for e in emails])}")
+
+    # No emails to process after filtering
+    if not emails:
+        if target_email_ids is not None:
+            return [{"status": "no_matches", "message": f"No matching emails found. Requested IDs: {', '.join(target_email_ids)}"}]
+        else:
+            return [{"status": "no_emails", "message": "No unread emails found"}]
+
+    processed_ids = []
+
+    for email in emails:
+        try:
+            # Strict validation before processing
+            if not email or not email.id:
+                print(f"[Email] ❌ Invalid email format - skipping")
+                continue
+
+            if not email.sender:
+                print(f"[Email] ⚠️ Email {email.id} has no sender - skipping")
+                continue
+
+            if not email.subject:
+                print(f"[Email] ⚠️ Email {email.id} has no subject - skipping")
+                continue
+
+            print(f"[Email] 🔍 Strict validation passed for: {email.subject} (ID: {email.id})")
+
+            # Generate AI reply
+            reply = generate_ai_reply(
+                email=email,
+                user_name=user_name,
+                user_context=user_context,
+                custom_instructions=custom_instructions,
+            )
+
+            # Create draft with strict validation
+            draft = create_draft_reply(
+                email=email,
+                reply_body=reply,
+                user_email=user_email,
+            )
+
+            results.append({
+                "status": "draft_created",
+                "email_id": email.id,
+                "thread_id": email.thread_id,
+                "sender": email.sender,
+                "subject": email.subject,
+                "date": email.date.isoformat(),
+                "snippet": email.snippet[:100],
+                "draft_subject": draft.subject,
+                "draft_body_preview": reply[:150] + ("..." if len(reply) > 150 else ""),
+            })
+            processed_ids.append(email.id)
+
+        except TokenExpiredError:
+            raise
+        except Exception as e:
+            print(f"[Email] ❌ Failed to process email {email.id} after strict validation: {e}")
+            results.append({
+                "status": "error",
+                "email_id": email.id,
+                "subject": email.subject,
+                "error": str(e),
+            })
+
+    # Mark as read if requested
+    if mark_read_after and processed_ids:
+        mark_as_read(processed_ids)
+
+    return results
+# ───────────────────────────────────────────────────────────────────────────────
+# Tool Interface for JARVIS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def email_action(
+    parameters: dict,
+    response=None,
+    player=None,
+    session_memory=None,
+) -> str:
+    """
+    JARVIS tool entry point for email operations.
+
+    Supported actions:
+    - fetch: Fetch recent unread emails (returns summaries)
+    - process: Fetch + generate AI replies + create drafts
+    - draft: Create a draft reply for a specific email (requires email_id)
+    - auth: Force re-authentication
+    - status: Check authentication status
+
+    Parameters:
+        action: "fetch" | "process" | "draft" | "auth" | "status"
+        max_results: Max emails to fetch (default: 10)
+        days_back: Days back to search (default: 7)
+        email_id: Specific email ID for draft action
+        custom_instructions / instructions: Additional AI instructions
+        mark_read: Whether to mark as read after processing (default: true)
+    """
+    action = parameters.get("action", "fetch").lower()
+    max_results = int(parameters.get("max_results", DEFAULT_MAX_RESULTS))
+    days_back = int(parameters.get("days_back", DEFAULT_DAYS_BACK))
+    # Accept both parameter names for compatibility
+    custom_instructions = parameters.get("custom_instructions") or parameters.get("instructions", "")
+    mark_read = parameters.get("mark_read", True)
+
+    # Load user config
+    user_name = load_api_keys().get("user_name", "")
+    user_email = get_user_email()
+    user_context = get_user_context()
+
+    if player:
+        player.write_log(f"[email] Action: {action}")
+
+    try:
+        if action == "auth":
+            force_reauth()
+            # Trigger new auth
+            get_gmail_service()
+            return "✅ Re-authentication complete. Gmail access granted."
+
+        elif action == "status":
+            creds = _load_token()
+            if creds and creds.valid:
+                expiry = creds.expiry.strftime("%Y-%m-%d %H:%M") if creds.expiry else "unknown"
+                return f"✅ Gmail authenticated (token expires: {expiry})"
+            elif creds:
+                return "⚠️ Gmail token exists but expired — will auto-refresh on next use"
+            else:
+                return "❌ Not authenticated. Run with action='auth' to set up."
+
+        elif action == "fetch":
+            emails = fetch_unread_emails(max_results=max_results, days_back=days_back)
+            if not emails:
+                return "📭 No unread emails found."
+
+            lines = [f"📬 Found {len(emails)} unread email(s):\n"]
+            for i, e in enumerate(emails, 1):
+                sender_name = e.sender.split("<")[0].strip() if "<" in e.sender else e.sender
+                lines.append(f"{i}. **{sender_name}** — {e.subject}")
+                lines.append(f"   📅 {e.date.strftime('%Y-%m-%d %H:%M')}  |  📝 {e.snippet[:80]}...")
+                lines.append("")
+            return "\n".join(lines)
+
+        elif action == "process":
+            results = process_unread_emails(
+                max_results=max_results,
+                days_back=days_back,
+                user_name=user_name,
+                user_context=user_context,
+                user_email=user_email,
+                custom_instructions=custom_instructions,
+                mark_read_after=mark_read,
+            )
+
+            # Format results for user
+            drafts = [r for r in results if r.get("status") == "draft_created"]
+            errors = [r for r in results if r.get("status") == "error"]
+
+            lines = [f"✅ Processed {len(emails)} email(s) — {len(drafts)} draft(s) created"]
+            if errors:
+                lines.append(f"⚠️ {len(errors)} error(s)")
+
+            for r in drafts:
+                lines.append(f"\n📧 **{r['sender']}** — {r['subject']}")
+                lines.append(f"   Draft: {r['draft_body_preview']}")
+
+            for r in errors:
+                lines.append(f"\n❌ {r['subject']}: {r['error']}")
+
+            if player:
+                player.write_log(f"[email] Created {len(drafts)} draft(s)")
+            return "\n".join(lines)
+
+        elif action == "draft":
+            email_id = parameters.get("email_id")
+            if not email_id:
+                return "❌ Please provide email_id for draft action"
+
+            # Fetch specific email
+            service = get_gmail_service()
+            msg = _execute_with_retry(
+                service.users().messages().get(userId="me", id=email_id, format="full")
+            )
+            email = _parse_gmail_message(msg)
+
+            # Generate reply
+            reply = generate_ai_reply(
+                email=email,
+                user_name=user_name,
+                user_context=user_context,
+                custom_instructions=custom_instructions,
+            )
+
+            # Create draft
+            draft = create_draft_reply(email=email, reply_body=reply, user_email=user_email)
+
+            return (
+                f"✅ Draft created for: {email.subject}\n"
+                f"To: {draft.to}\n"
+                f"Subject: {draft.subject}\n\n"
+                f"Preview:\n{reply[:300]}..."
+            )
+
+        else:
+            return f"❌ Unknown action: {action}. Use: fetch, process, draft, auth, status"
+
+    except TokenExpiredError:
+        return ("❌ Authentication expired. Please run email action with action='auth' "
+                "to re-authenticate with Google.")
+    except AuthenticationError as e:
+        return f"❌ Authentication error: {e}"
+    except RateLimitError:
+        return "❌ Rate limit exceeded. Please wait a moment and try again."
+    except NetworkError as e:
+        return f"❌ Network error: {e}"
+    except EmailError as e:
+        return f"❌ Email error: {e}"
+    except Exception as e:
+        traceback.print_exc()
+        return f"❌ Unexpected error: {e}"
+# ───────────────────────────────────────────────────────────────────────────────
+# Tool Declaration for JARVIS
+# ───────────────────────────────────────────────────────────────────────────────
+
+EMAIL_TOOL_DECLARATION = {
+    "name": "email",
+    "description": (
+        "Manages Gmail via API: fetch unread emails, generate AI replies, create drafts. "
+        "Does NOT send emails directly — creates drafts for your review. "
+        "Actions: fetch (list unread), process (fetch + AI drafts), draft (reply to specific email), "
+        "auth (re-authenticate), status (check auth)."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "action": {
+                "type": "STRING",
+                "description": "fetch | process | draft | auth | status",
+                "enum": ["fetch", "process", "draft", "auth", "status"],
+            },
+            "max_results": {
+                "type": "INTEGER",
+                "description": "Maximum emails to fetch (default: 10, max: 50)",
+            },
+            "days_back": {
+                "type": "INTEGER",
+                "description": "How many days back to search (default: 7)",
+            },
+            "email_id": {
+                "type": "STRING",
+                "description": "Specific email ID for draft action",
+            },
+            "custom_instructions": {
+                "type": "STRING",
+                "description": "Additional instructions for AI reply generation",
+            },
+            "mark_read": {
+                "type": "BOOLEAN",
+                "description": "Mark emails as read after processing (default: true)",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Setup Helper
+# ───────────────────────────────────────────────────────────────────────────────
+
+def setup_gmail_credentials(credentials_json: str) -> bool:
+    """
+    Save Gmail OAuth credentials from JSON string.
+
+    Args:
+        credentials_json: Full OAuth client credentials JSON from Google Cloud Console
+
+    Returns:
+        True if saved successfully
+    """
+    try:
+        data = json.loads(credentials_json)
+        # Validate structure
+        if "installed" not in data and "web" not in data:
+            raise ValueError("Invalid credentials format — must be OAuth client ID for Desktop or Web app")
+
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CREDENTIALS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        print(f"[Email] ✅ Credentials saved to {CREDENTIALS_FILE}")
+        return True
+    except json.JSONDecodeError as e:
+        print(f"[Email] ❌ Invalid JSON: {e}")
+        return False
+    except Exception as e:
+        print(f"[Email] ❌ Failed to save credentials: {e}")
+        return False
+def get_setup_instructions() -> str:
+    """Return setup instructions for Gmail API."""
+    return f"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    GMAIL API SETUP FOR JARVIS                              ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+1. Go to Google Cloud Console:                                             ║
+   https://console.cloud.google.com/                                       ║
+                                                                              ║
+2. Create a new project or select existing one                            ║
+                                                                              ║
+3. Enable Gmail API:                                                       ║
+   APIs & Services → Library → Search "Gmail API" → Enable                ║
+                                                                              ║
+4. Create OAuth 2.0 Credentials:                                           ║
+   APIs & Services → Credentials → Create Credentials → OAuth Client ID   ║
+   - Application type: Desktop Application                                 ║
+   - Name: JARVIS Assistant                                                ║
+   - Authorized redirect URIs: http://localhost:8080/                     ║
+                                                                              ║
+5. Download the credentials JSON file                                      ║
+                                                                              ║
+6. Save as: {CREDENTIALS_FILE}                                           ║
+                                                                              ║
+7. Add your user info to config/api_keys.json:                             ║
+   {{                                                                      ║
+     "user_name": "Your Name",                                             ║
+     "user_email": "your.email@gmail.com",                                 ║
+     "user_context": "Your role/context for AI replies"                    ║
+   }}                                                                      ║
+                                                                              ║
+8. Run JARVIS and use: "JARVIS, check my email" or "process my emails"    ║
+                                                                              ║
+   ⚠️  First run will open browser for Google OAuth consent.                 ║
+      Tokens are stored securely in: {TOKEN_FILE}                           ║
+                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+# ───────────────────────────────────────────────────────────────────────────────
+# Module Test
+# ───────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="JARVIS Email Module")
+    parser.add_argument("action", nargs="?", default="status",
+                        choices=["fetch", "process", "auth", "status", "setup"])
+    parser.add_argument("--max", type=int, default=10, help="Max emails")
+    parser.add_argument("--days", type=int, default=7, help="Days back")
+    parser.add_argument("--instructions", type=str, default="", help="Custom AI instructions")
+    args = parser.parse_args()
+
+    print(get_setup_instructions())
+
+    if args.action == "setup":
+        print("Paste your OAuth credentials JSON (Ctrl+D to end):")
+        import sys
+        creds_json = sys.stdin.read()
+        if setup_gmail_credentials(creds_json):
+            print("✅ Credentials saved. Run with 'auth' to authenticate.")
+        sys.exit(0)
+
+    params = {
+        "action": args.action,
+        "max_results": args.max,
+        "days_back": args.days,
+        "custom_instructions": args.instructions,
+    }
+
+    result = email_action(params)
+    print(result)

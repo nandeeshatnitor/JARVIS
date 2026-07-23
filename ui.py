@@ -689,6 +689,16 @@ class LogWidget(QTextEdit):
 
     def append_log(self, text: str):
         self._sig.emit(text)
+        # Also log to Python logging module so it goes to log files
+        try:
+            import logging
+            tl = text.lower()
+            if tl.startswith("err") or "error" in tl:
+                logging.warning(text)
+            else:
+                logging.info(text)
+        except Exception:
+            pass
 
     def _enqueue(self, text: str):
         self._queue.append(text)

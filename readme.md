@@ -37,6 +37,7 @@ MARK XLIX deepens the personal assistant foundation. Rather than adding more too
 | 💻 Code Helper | Inline code review, debugging, and generation |
 | 🌐 Browser Control | Open URLs, navigate tabs, and interact with the browser by voice |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
+| 📧 Email | Gmail API integration: fetch unread emails, AI-generated draft replies, human review |
 | 🎬 YouTube Control | Search, play, and control YouTube playback by voice |
 | 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
 | 🧑‍💻 Silent Language Memory | Detects spoken language on first use and saves it — all future sessions adapt automatically |
@@ -125,12 +126,57 @@ Mark XLIX/
 │   ├── code_helper.py       # Code review and generation
 │   ├── dev_agent.py         # Developer task agent
 │   ├── desktop.py           # Desktop and taskbar control
-│   └── proactive.py         # Proactive silence-break suggestions
+│   ├── proactive.py         # Proactive silence-break suggestions
+│   └── email.py             # Gmail API: fetch, AI replies, draft creation
 ├── memory/                  # Persistent key-value memory store
 ├── core/
 │   └── prompt.txt           # Assistant personality and tool-routing rules
 └── config/
     └── api_keys.json        # API key, OS setting, assistant name, user name
+```
+---
+
+## 📧 Gmail API Setup
+
+To enable the Email module, you need to configure Gmail API access:
+
+1. **Go to Google Cloud Console**: https://console.cloud.google.com/
+
+2. **Create or select a project**
+
+3. **Enable Gmail API**:
+   - APIs & Services → Library → Search "Gmail API" → Enable
+
+4. **Create OAuth 2.0 Credentials**:
+   - APIs & Services → Credentials → Create Credentials → OAuth Client ID
+   - Application type: **Desktop Application**
+   - Name: "JARVIS Assistant"
+   - Authorized redirect URIs: `http://localhost:8080/`
+
+5. **Download the credentials JSON** and save as:
+   ```
+   config/gmail_credentials.json
+   ```
+
+6. **Add user info to config/api_keys.json**:
+   ```json
+   {
+     "gemini_api_key": "your-gemini-key",
+     "os_system": "windows",
+     "user_name": "Your Name",
+     "user_email": "your.email@gmail.com",
+     "user_context": "Brief description of your role/context for AI replies"
+   }
+   ```
+
+7. **First run**: Say "JARVIS, check my email" or use the `email` tool with `action: auth`. A browser window will open for Google OAuth consent. Tokens are stored securely in `config/gmail_token.json`.
+
+### Email Commands
+- **"Check my email"** — Fetch recent unread emails
+- **"Process my emails"** — Fetch unread, generate AI replies, create drafts
+- **"Email status"** — Check authentication status
+
+> ⚠️ **Security**: Emails are fetched via Gmail API (no browser automation). Drafts are created for your review — nothing is sent automatically.
 ```
 
 ---
