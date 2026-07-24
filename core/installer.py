@@ -28,6 +28,8 @@ _CORE: list[tuple[str, str]] = [
     ("pygetwindow",        "pygetwindow"),
     ("mss",                "mss"),
     ("cv2",                "opencv-python"),
+    ("insightface",        "insightface"),
+    ("onnxruntime",        "onnxruntime"),
     ("soundfile",          "soundfile"),
     ("miniaudio",          "miniaudio"),
     ("send2trash",         "send2trash"),

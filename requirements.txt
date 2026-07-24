@@ -16,6 +16,8 @@ pyperclip
 pygetwindow
 opencv-python
 numpy
+insightface
+onnxruntime
 mss
 psutil
 send2trash
