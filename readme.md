@@ -23,6 +23,9 @@ MARK XLIX deepens the personal assistant foundation. Rather than adding more too
 | 🧩 Autonomous Tasks | High-level planning for complex multi-step goals via agent mode |
 | 👁️ Visual Awareness | Real-time screen capture and webcam vision piped into your main Gemini session |
 | 🧠 Persistent Memory | Deeply remembers projects, preferences, and personal context across sessions |
+| 👤 Face Recognition | Remembers people by face — enroll with "This is Alice", recognize later across sessions |
+| 🎥 Visual Memory | Stores images, videos, and keyframes with detected people, objects, OCR text, and scene descriptions |
+| 🔗 Episodic Memory | Links people, media, and events into a searchable timeline of your life |
 | ⌨️ Hybrid Input | Seamlessly switch between keyboard typing and voice commands |
 | 🌅 Morning Briefing | On first boot: greets you, reads the time, fetches live news headlines, and checks weather |
 | 🔔 Proactive Check-ins | After 15 minutes of silence, checks context and offers something genuinely useful |
@@ -128,12 +131,116 @@ Mark XLIX/
 │   ├── desktop.py           # Desktop and taskbar control
 │   ├── proactive.py         # Proactive silence-break suggestions
 │   └── email.py             # Gmail API: fetch, AI replies, draft creation
-├── memory/                  # Persistent key-value memory store
+├── memory/                  # Persistent memory system (SQLite + JSON)
+│   ├── db.py                # SQLite schema, CRUD, migrations
+│   ├── memory_manager.py    # Textual memory API (load/save/update/forget)
+│   ├── vector_store.py      # Embedding storage (SQLite BLOB, FAISS-ready)
+│   ├── face_memory.py       # Face enrollment, recognition, history
+│   ├── media_memory.py      # Image/video/keyframe storage and queries
+│   ├── event_memory.py      # Episodic memory linking people, media, events
+│   └── config_manager.py    # Configuration management
+├── recognition/             # Modular CV backends
+│   └── face_backend.py      # InsightFace face detection + embedding
+├── tests/
+│   └── test_visual_memory.py # Integration tests for visual memory
 ├── core/
 │   └── prompt.txt           # Assistant personality and tool-routing rules
 └── config/
     └── api_keys.json        # API key, OS setting, assistant name, user name
 ```
+---
+
+## 👤 Face Recognition & Visual Memory
+
+### Overview
+
+MARK XLIX can remember people by their face and store rich visual memories. When someone is introduced, their face is detected, a 512-dimensional embedding is extracted using InsightFace, and stored in the database. Later, whenever the camera captures a face, the system identifies who it is with a confidence score.
+
+### How It Works
+
+**Architecture:**
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    Application Layer                 │
+│  (main.py — Gemini Live, voice, tool dispatch)       │
+├─────────────────────────────────────────────────────┤
+│                   Memory Services                    │
+│  FaceMemory  — enrollment, recognition, history      │
+│  MediaMemory — image/video/keyframe storage          │
+│  EventMemory — links people, media, events           │
+│  VectorStore — embedding similarity search           │
+├─────────────────────────────────────────────────────┤
+│                 Recognition Layer                    │
+│  FaceBackend — InsightFace (detection + embedding)   │
+├─────────────────────────────────────────────────────┤
+│                   Storage Layer                      │
+│  SQLite (metadata) + float32 BLOBs (embeddings)      │
+│  File system (images, videos, keyframes)             │
+└─────────────────────────────────────────────────────┘
+```
+
+**Database Schema:**
+
+| Table | Purpose |
+|---|---|
+| `people` | Person records (name, first/last seen, embedding dim) |
+| `person_embeddings` | float32 BLOB embeddings (multiple per person) |
+| `media` | Images, videos, clips with metadata |
+| `keyframes` | Extracted frames from videos with timestamps |
+| `detected_objects` | Object detections (label, confidence, bbox) |
+| `detected_people` | Person detections linked to people table |
+| `ocr_text` | OCR text extracted from media |
+| `scene_descriptions` | LLM-generated scene descriptions |
+| `events` | Episodic memory events (introductions, meetings, sightings) |
+| `event_media` | Junction: events ↔ media |
+| `event_people` | Junction: events ↔ people |
+
+### Voice Commands
+
+| Command | What It Does |
+|---|---|
+| **"This is Alice"** | Captures a camera frame, detects the face, creates a person record, stores the embedding, and creates an introduction event |
+| **"Who is this?"** / **"Who is in front of the camera?"** | Captures a camera frame, detects faces, and identifies them against known people |
+| **"When did you last see Alice?"** | Returns the most recent event involving that person |
+| **"When did you first meet Bob?"** | Returns the first event involving that person |
+| **"Find videos containing both Alice and Charlie"** | Finds media where both people were detected |
+
+### Key Design Decisions
+
+1. **InsightFace** — Uses the `buffalo_l` model with RetinaFace detection and ArcFace R100 recognition (512-dim embeddings, CPU-compatible)
+2. **Multiple embeddings per person** — Each enrollment adds a new embedding, improving recognition accuracy over time
+3. **Auto-enrollment** — When recognition confidence exceeds 0.85, the embedding is automatically saved to improve future recognition
+4. **Normalized schema** — Every entity is its own table with foreign keys; no JSON blobs for structured data
+5. **Vector store abstraction** — The `VectorStore` ABC allows swapping SQLite for FAISS or pgvector without changing callers
+6. **Media decomposition** — Videos are decomposed into keyframes, each with its own detections and metadata
+7. **Backward compatible** — The existing textual memory system is unchanged; new tables are additive
+
+### Installation
+
+InsightFace and ONNX Runtime are included in `requirements.txt`. On first use, the model (~400 MB) is downloaded automatically.
+
+```bash
+pip install insightface onnxruntime
+```
+
+### Storage Location
+
+Visual memories are stored under `memory/storage/media/`:
+
+```
+memory/storage/media/
+├── images/
+│   └── 2026-07-24/
+│       ├── <sha256[:16]>.jpg
+├── videos/
+│   └── 2026-07-24/
+│       ├── <sha256[:16]>.mp4
+└── keyframes/
+    └── <media_id>/
+        ├── <media_time>.jpg
+```
+
 ---
 
 ## 📧 Gmail API Setup
