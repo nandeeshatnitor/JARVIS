@@ -213,16 +213,18 @@ class SQLiteVectorStore(VectorStore):
         if not mask.any():
             return []
 
-        # Get top-k indices
+        # Get top-k indices — use original indices to map back to rows
+        original_indices = np.where(mask)[0]
         sims = similarities[mask]
-        indices = np.argsort(sims)[::-1][:top_k]
+        sorted_order = np.argsort(sims)[::-1][:top_k]
+        top_original = original_indices[sorted_order]
 
         results = []
-        for idx in indices:
-            row = rows[idx]
+        for orig_idx in top_original:
+            row = rows[orig_idx]
             results.append(VectorSearchResult(
                 person_id=row["person_id"],
-                similarity=float(sims[idx]),
+                similarity=float(similarities[orig_idx]),
                 embedding_id=row["id"],
             ))
         return results
