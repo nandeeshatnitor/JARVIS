@@ -30,8 +30,11 @@ from google import genai
 from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
-    load_memory, update_memory, format_memory_for_prompt,
+    load_memory, update_memory, format_memory_for_prompt, init_memory,
 )
+from memory.face_memory import FaceMemory
+from memory.media_memory import MediaMemory
+from memory.event_memory import EventMemory
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -552,6 +555,61 @@ TOOL_DECLARATIONS = [
             "required": ["action"]
         }
     },
+    {
+        "name": "enroll_person",
+        "description": (
+            "Enroll a new person into face memory by name. "
+            "Call this when the user introduces someone, e.g., 'This is Alice' or 'Meet Bob'. "
+            "Captures a camera frame, detects the face, creates a person record, and stores "
+            "the face embedding. If a person with the same name already exists, their embeddings "
+            "are updated with the new face. "
+            "Returns the person ID and number of faces detected."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "name": {
+                    "type": "STRING",
+                    "description": "The person's name (e.g., 'Alice', 'John Smith')"
+                }
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "recognize_person",
+        "description": (
+            "Recognize people in the current camera frame. "
+            "Detects all faces, compares them against known people in face memory, "
+            "and returns their names with confidence scores. "
+            "Unknown faces are reported as 'unknown'. "
+            "Use when the user asks 'Who is this?' or 'Who is in front of the camera?'"
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "find_person_memory",
+        "description": (
+            "Query face memory for information about a person. "
+            "Returns when they were first seen, last seen, how many face embeddings "
+            "are stored, and a summary of events they participated in. "
+            "Use when the user asks 'When did you last see Alice?' or 'Tell me about Bob'."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "name": {
+                    "type": "STRING",
+                    "description": "The person's name to look up"
+                }
+            },
+            "required": ["name"]
+        }
+    },
 ]
 
 # --- Plugin system ---
@@ -584,6 +642,11 @@ class JarvisLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+
+        # Visual memory services
+        self._face_memory   = FaceMemory()
+        self._media_memory  = MediaMemory()
+        self._event_memory  = EventMemory()
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -667,7 +730,7 @@ class JarvisLive:
             log.warning(f"Username exception: {e}")
 
         memory     = load_memory()
-        mem_str    = format_memory_for_prompt(memory)
+        mem_str    = format_memory_for_prompt(memory, face_memory=self._face_memory)
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
@@ -876,6 +939,89 @@ class JarvisLive:
                         )
                     )
                     result = r or "Done."
+
+            elif name == "enroll_person":
+                person_name = args.get("name", "").strip()
+                if not person_name:
+                    result = "I need a name to enroll. Please say 'This is Alice' or similar."
+                else:
+                    try:
+                        img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+                        person_id = self._face_memory.enroll_person(
+                            person_name, img_bytes, source="camera"
+                        )
+                        if person_id:
+                            # Store the image as media and link to the person
+                            media_id = self._media_memory.store_image(
+                                img_bytes, source="camera",
+                                metadata={"person_name": person_name}
+                            )
+                            # Create an introduction event
+                            event_id = self._event_memory.create_event(
+                                event_type="introduction",
+                                title=f"Met {person_name}",
+                                description=f"{person_name} was introduced via camera enrollment.",
+                                location=None,
+                            )
+                            self._event_memory.link_person(event_id, person_id, role="introduced")
+                            self._event_memory.link_media(event_id, media_id, role="primary")
+
+                            emb_count = self._face_memory.count_embeddings()
+                            result = f"Enrolled {person_name} (ID: {person_id}). Face embeddings stored. Total embeddings: {emb_count}."
+                        else:
+                            result = f"I couldn't detect a face in the camera frame. Please make sure you're facing the camera and try again."
+                    except Exception as e:
+                        result = f"Face enrollment failed: {e}. Make sure insightface is installed."
+
+            elif name == "recognize_person":
+                try:
+                    img_bytes, _ = await loop.run_in_executor(None, _capture_camera)
+                    matches = self._face_memory.recognize_faces(img_bytes)
+                    if not matches:
+                        result = "I didn't detect any faces in the camera frame."
+                    else:
+                        parts = []
+                        for m in matches:
+                            if m.is_known:
+                                parts.append(f"{m.person_name} (confidence: {m.confidence:.2f})")
+                            else:
+                                parts.append(f"Unknown person (confidence: {m.confidence:.2f})")
+                        result = f"Detected {len(matches)} face(s): " + ", ".join(parts)
+                except Exception as e:
+                    result = f"Face recognition failed: {e}. Make sure insightface is installed."
+
+            elif name == "find_person_memory":
+                person_name = args.get("name", "").strip()
+                if not person_name:
+                    result = "I need a name to look up."
+                else:
+                    person = self._face_memory.find_person_by_name(person_name)
+                    if not person:
+                        result = f"I don't have {person_name} in my face memory."
+                    else:
+                        # Get last and first events
+                        last_event = self._event_memory.get_last_event_with_person(person.id)
+                        first_event = self._event_memory.get_first_event_with_person(person.id)
+
+                        lines = [
+                            f"Person: {person.name}",
+                            f"First seen: {person.first_seen}",
+                            f"Last seen: {person.last_seen}",
+                            f"Face embeddings: {person.embedding_count}",
+                        ]
+                        if first_event:
+                            lines.append(f"First event: {first_event.title} at {first_event.started_at}")
+                        if last_event:
+                            lines.append(f"Last event: {last_event.title} at {last_event.started_at}")
+
+                        # Get recent sightings
+                        history = self._face_memory.get_person_history(person.id, limit=5)
+                        if history:
+                            lines.append("Recent sightings:")
+                            for h in history[:3]:
+                                lines.append(f"  - {h['created_at']}: {h['media_type']} (confidence: {h['confidence']:.2f})")
+
+                        result = "\n".join(lines)
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
@@ -1426,6 +1572,8 @@ def main():
 
     def runner():
         ui.wait_for_api_key()
+        # Initialise persistent memory (creates DB, migrates legacy JSON)
+        init_memory()
         jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())

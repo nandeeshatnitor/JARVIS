@@ -4,6 +4,18 @@ from threading import Lock
 from pathlib import Path
 import sys
 
+from memory.db import (
+    ensure_db_ready,
+    db_load_memory,
+    db_save_memory,
+    db_upsert,
+    db_delete,
+    db_count,
+    VALID_CATEGORIES,
+    MAX_VALUE_LENGTH,
+    MEMORY_MAX_CHARS,
+)
+
 
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -12,10 +24,18 @@ def get_base_dir() -> Path:
 
 
 BASE_DIR         = get_base_dir()
-MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
+MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"  # legacy path, kept for compat
 _lock            = Lock()
-MAX_VALUE_LENGTH = 380
-MEMORY_MAX_CHARS = 2200
+
+
+def init_memory() -> None:
+    """
+    Initialise the persistent memory store.
+    Call this once at application startup before any memory operations.
+    Creates the SQLite database (if needed) and migrates legacy JSON data.
+    """
+    ensure_db_ready()
+
 
 def _empty_memory() -> dict:
     return {
@@ -28,21 +48,12 @@ def _empty_memory() -> dict:
     }
 
 def load_memory() -> dict:
-    if not MEMORY_PATH.exists():
+    """Load all memories from the database."""
+    try:
+        return db_load_memory()
+    except Exception as e:
+        print(f"[Memory] ⚠️ Load error: {e}")
         return _empty_memory()
-    with _lock:
-        try:
-            data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                base = _empty_memory()
-                for key in base:
-                    if key not in data:
-                        data[key] = {}
-                return data
-            return _empty_memory()
-        except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
 
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
@@ -68,15 +79,14 @@ def _trim_to_limit(memory: dict) -> dict:
     return memory
 
 def save_memory(memory: dict) -> None:
+    """Persist the entire memory dict to the database."""
     if not isinstance(memory, dict):
         return
     memory = _trim_to_limit(memory)
-    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    try:
+        db_save_memory(memory)
+    except Exception as e:
+        print(f"[Memory] ⚠️ Save error: {e}")
 
 
 def _truncate_value(val: str) -> str:
@@ -108,16 +118,57 @@ def _recursive_update(target: dict, updates: dict) -> bool:
     return changed
 
 
+def _collect_leaf_entries(updates: dict, category: str = "") -> list[tuple]:
+    """
+    Walk the nested update dict and collect (category, key, value, updated)
+    tuples for every leaf entry that has a 'value' key.
+    """
+    results = []
+    for key, value in updates.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, dict) and "value" not in value:
+            # Nested category — recurse
+            results.extend(_collect_leaf_entries(value, category=key))
+        elif isinstance(value, dict) and "value" in value:
+            # Leaf entry
+            new_val = _truncate_value(str(value["value"]))
+            updated = value.get("updated", datetime.now().strftime("%Y-%m-%d"))
+            results.append((category, key, new_val, updated))
+    return results
+
+
 def update_memory(memory_update: dict) -> dict:
     if not isinstance(memory_update, dict) or not memory_update:
         return load_memory()
     memory = load_memory()
     if _recursive_update(memory, memory_update):
-        save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        # Upsert only the changed entries directly to the DB
+        entries = _collect_leaf_entries(memory_update)
+        for cat, key, val, updated in entries:
+            if cat in VALID_CATEGORIES:
+                try:
+                    db_upsert(cat, key, val, updated)
+                except Exception as e:
+                    print(f"[Memory] ⚠️ Upsert error for {cat}/{key}: {e}")
+        print(f"[Memory] Saved: {list(memory_update.keys())}")
     return memory
 
-def format_memory_for_prompt(memory: dict | None) -> str:
+def format_memory_for_prompt(
+    memory: dict | None,
+    face_memory=None,
+) -> str:
+    """
+    Format memory into a string for the LLM system prompt.
+
+    Args:
+        memory: The textual memory dict (from load_memory()).
+        face_memory: Optional FaceMemory instance. If provided, known
+                     people are listed with their first/last seen dates
+                     and embedding counts.
+    """
     if not memory:
         return ""
 
@@ -165,6 +216,21 @@ def format_memory_for_prompt(memory: dict | None) -> str:
             if val:
                 lines.append(f"  - {key.replace('_', ' ').title()}: {val}")
 
+    # ── Face memory: known people ─────────────────────────────────────────
+    if face_memory is not None and face_memory.is_available:
+        try:
+            people = face_memory.list_people()
+            if people:
+                lines.append("")
+                lines.append("People I can recognize (face memory):")
+                for p in people[:10]:
+                    lines.append(
+                        f"  - {p.name} (first seen: {p.first_seen}, "
+                        f"embeddings: {p.embedding_count})"
+                    )
+        except Exception:
+            pass  # Don't break the prompt if face memory fails
+
     wishes = memory.get("wishes", {})
     if wishes:
         lines.append("")
@@ -194,21 +260,20 @@ def format_memory_for_prompt(memory: dict | None) -> str:
     return result + "\n"
 
 def remember(key: str, value: str, category: str = "notes") -> str:
-    valid = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}
-    if category not in valid:
+    if category not in VALID_CATEGORIES:
         category = "notes"
     update_memory({category: {key: {"value": value}}})
     return f"Remembered: {category}/{key} = {value}"
 
 
 def forget(key: str, category: str = "notes") -> str:
-    memory = load_memory()
-    cat    = memory.get(category, {})
-    if key in cat:
-        del cat[key]
-        memory[category] = cat
-        save_memory(memory)
-        return f"Forgotten: {category}/{key}"
+    if category not in VALID_CATEGORIES:
+        category = "notes"
+    try:
+        if db_delete(category, key):
+            return f"Forgotten: {category}/{key}"
+    except Exception as e:
+        print(f"[Memory] ⚠️ Forget error: {e}")
     return f"Not found: {category}/{key}"
 
 
