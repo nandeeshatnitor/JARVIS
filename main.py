@@ -15,6 +15,7 @@ if _platform.system() == "Windows":
     _subprocess.Popen = _Popen
 # ─────────────────────────────────────────────────────────────────────────────
 
+import os
 import asyncio
 import re
 import threading
@@ -58,6 +59,9 @@ from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
 from actions.email             import email_action
 from memory.config_manager     import get_brief_enabled
+
+# ── Ignore warnings ───────────────────────────────────────────────────────────
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 from core.logging_config import setup_logging, get_logger
