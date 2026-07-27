@@ -1251,13 +1251,13 @@ class HueWheel(QWidget):
 
 
 class CustomizeOverlay(QWidget):
-    """Floating overlay — change assistant name, user name and UI colour."""
+    """Floating overlay — change assistant name, user name, UI colour and VAD timeout."""
 
-    saved = pyqtSignal(str, str, str)   # assistant_name, user_name, ui_color
-    _OW, _OH = 400, 500
+    saved = pyqtSignal(str, str, str, int)   # assistant_name, user_name, ui_color, vad_timeout_ms
+    _OW, _OH = 400, 580
 
     def __init__(self, assistant_name="JARVIS", user_name="",
-                 ui_color=DEFAULT_UI_COLOR, parent=None):
+                 ui_color=DEFAULT_UI_COLOR, vad_timeout_ms=15000, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -1345,6 +1345,46 @@ class CustomizeOverlay(QWidget):
         self._hex_input.textEdited.connect(self._on_hex_edited)
         lay.addWidget(self._hex_input)
 
+        # ── VAD silence timeout ──────────────────────────────────────────────
+        lay.addSpacing(8)
+        vad_hdr = QHBoxLayout()
+        vad_hdr.addWidget(_lbl("SPEAKING TIMEOUT (VAD silence)", 8,
+                               color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        vad_hdr.addStretch()
+        lay.addLayout(vad_hdr)
+
+        self._vad_input = QLineEdit(str(vad_timeout_ms))
+        self._vad_input.setPlaceholderText("Silence timeout in ms (default: 15000)")
+        self._vad_input.setFont(QFont("Courier New", 10))
+        self._vad_input.setFixedHeight(32)
+        self._vad_input.setStyleSheet(_fs)
+        self._vad_input.setToolTip(
+            "How long JARVIS waits for silence before ending its turn. "
+            "Increase if JARVIS stops speaking too early during long responses. "
+            "Default: 15000 ms (15 seconds). Recommended: 30000–60000 ms for long answers."
+        )
+        lay.addWidget(self._vad_input)
+
+        # Preset buttons for VAD timeout
+        vad_presets = QHBoxLayout()
+        vad_presets.setSpacing(6)
+        for ms, label in [(5000, "5s"), (10000, "10s"), (15000, "15s"), (30000, "30s"), (45000, "45s"), (60000, "60s"), (120000, "120s")]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(24)
+            btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C.PANEL2}; color: {C.TEXT_MED};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
+            """)
+            btn.clicked.connect(lambda _, v=ms: self._set_vad_timeout(v))
+            vad_presets.addWidget(btn)
+        vad_presets.addStretch()
+        lay.addLayout(vad_presets)
+
         lay.addSpacing(6)
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
 
@@ -1389,6 +1429,11 @@ class CustomizeOverlay(QWidget):
         if preview and self.on_preview:
             self.on_preview(self._sel_color)
 
+    def _set_vad_timeout(self, ms: int):
+        self._vad_input.blockSignals(True)
+        self._vad_input.setText(str(ms))
+        self._vad_input.blockSignals(False)
+
     def _on_wheel_pick(self, hx: str):
         # Sürükleme sırasında: hex kutusunu güncelle, temayı henüz uygulama
         self._sel_color = hx
@@ -1418,7 +1463,8 @@ class CustomizeOverlay(QWidget):
     def _save(self):
         name = self._name_input.text().strip() or "JARVIS"
         user = self._user_input.text().strip()
-        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR)
+        vad_ms = int(self._vad_input.text().strip() or "15000")
+        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, vad_ms)
         self.hide()
 
 
@@ -3113,6 +3159,7 @@ class MainWindow(QMainWindow):
             cfg.get("assistant_name", "JARVIS") or "JARVIS",
             cfg.get("user_name", ""),
             cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
+            cfg.get("vad_silence_timeout_ms", 15000),
             parent=cw,
         )
         ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
@@ -3133,7 +3180,7 @@ class MainWindow(QMainWindow):
         if apply_ui_accent(hex_color):
             retheme_all_widgets(old, current_palette())
 
-    def _apply_name_update(self, name: str, user_name: str, ui_color: str = ""):
+    def _apply_name_update(self, name: str, user_name: str, ui_color: str = "", vad_timeout_ms: int = 15000):
         """Update all name/theme-dependent UI elements and persist to config."""
         self._assistant_name = name.strip() or "JARVIS"
         display = self._assistant_name.upper()
@@ -3160,6 +3207,7 @@ class MainWindow(QMainWindow):
             data["user_name"] = user_name.strip()
             if ui_color:
                 data["ui_color"] = ui_color.strip().lower()
+            data["vad_silence_timeout_ms"] = int(vad_timeout_ms)
             API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
             self._log.append_log(f"SYS: Identity updated — {display}")
             if color_changed:

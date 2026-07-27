@@ -30,7 +30,6 @@ def _get_api_key() -> str:
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
-
 def _gemini_client():
     from google import genai
     _c = genai.Client(api_key=_get_api_key())
@@ -40,7 +39,6 @@ def _gemini_client():
             return _c.models.generate_content(model="gemini-2.5-flash", contents=contents)
 
     return _W()
-
 
 def _detect_type(path: Path) -> str:
     ext = path.suffix.lower().lstrip(".")
@@ -66,7 +64,6 @@ def _detect_type(path: Path) -> str:
     if ext == "xml":       return "xml"
     if ext in ("pptx", "ppt"): return "pptx"
     return "unknown"
-
 
 def _file_size_str(path: Path) -> str:
     size = path.stat().st_size
@@ -220,6 +217,73 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             return result
         except Exception as e:
             return f"AI analysis failed: {e}"
+    
+    if action in ("summarize_images", "describe_images", "extract_images"):
+        try:
+            import fitz  # noqa: F401 — availability check
+        except ImportError:
+            return "PyMuPDF is not installed. Run: pip install pymupdf"
+
+        try:
+            max_images = int(params.get("max_images", 20))
+        except (TypeError, ValueError):
+            max_images = 20
+
+        try:
+            raw_images = _extract_pdf_images(path, max_images=max_images)
+        except Exception as e:
+            return f"Could not extract images from PDF: {e}"
+
+        if not raw_images:
+            return "No embedded images found in this PDF."
+
+        try:
+            from PIL import Image
+        except ImportError:
+            return "Pillow is not installed. Run: pip install Pillow"
+
+        import io as _io
+        pil_images = []
+        for b in raw_images:
+            try:
+                pil_images.append(Image.open(_io.BytesIO(b)))
+            except Exception:
+                continue
+
+        if not pil_images:
+            return "Found image objects in the PDF, but none could be decoded."
+
+        if action == "extract_images":
+            out_dir = path.parent / f"{path.stem}_images"
+            out_dir.mkdir(exist_ok=True)
+            saved = 0
+            for i, img in enumerate(pil_images, 1):
+                try:
+                    img.convert("RGB").save(out_dir / f"image_{i:02d}.png")
+                    saved += 1
+                except Exception:
+                    continue
+            return f"Extracted {saved} image(s) from {path.name} to: {out_dir}"
+
+        # summarize_images / describe_images → hand images to Gemini vision
+        try:
+            model  = _gemini_client()
+            prompt = params.get("instruction") or (
+                f"These {len(pil_images)} images were extracted from the PDF "
+                f"'{path.name}'. Briefly describe what each one shows, then give "
+                "a short overall summary of what the images collectively convey."
+            )
+            contents = [prompt] + pil_images[:16]
+            response = model.generate_content(contents)
+            result   = response.text.strip()
+        except Exception as e:
+            return f"AI image summary failed: {e}"
+
+        if len(result) > 600 and params.get("save", True):
+            out = _output_path(path, "images_summary", ".txt")
+            out.write_text(result, encoding="utf-8")
+            return f"{result[:400]}...\n\nFull result saved: {out.name}"
+        return result
 
     if action == "info":
         try:
@@ -248,6 +312,30 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             return "python-docx not installed. Run: pip install python-docx"
 
     return f"Unknown PDF action: '{action}'. Try: summarize, extract_text, info, to_word"
+
+def _extract_pdf_images(path: Path, max_images: int = 20) -> list[bytes]:
+    """
+    Pulls the raw embedded raster images out of a PDF (photos, figures,
+    diagrams — not the rendered page itself). Requires PyMuPDF.
+    Returns a list of raw image bytes (still encoded, e.g. PNG/JPEG).
+    """
+    import fitz  # PyMuPDF
+
+    images: list[bytes] = []
+    doc = fitz.open(path)
+    try:
+        for page_index in range(len(doc)):
+            for img in doc[page_index].get_images(full=True):
+                if len(images) >= max_images:
+                    return images
+                xref = img[0]
+                try:
+                    images.append(doc.extract_image(xref)["image"])
+                except Exception:
+                    continue
+    finally:
+        doc.close()
+    return images
 
 def _process_text_doc(path: Path, file_type: str, action: str,
                        params: dict, speak=None) -> str:
@@ -310,7 +398,6 @@ def _process_text_doc(path: Path, file_type: str, action: str,
         return result
     except Exception as e:
         return f"AI processing failed: {e}"
-
 
 def _process_data(path: Path, file_type: str, action: str,
                   params: dict, speak=None) -> str:
@@ -408,7 +495,6 @@ def _process_data(path: Path, file_type: str, action: str,
         return response.text.strip()
     except Exception as e:
         return f"Processing failed: {e}"
-
 
 def _process_json(path: Path, action: str, params: dict, speak=None) -> str:
     action = action or "analyze"

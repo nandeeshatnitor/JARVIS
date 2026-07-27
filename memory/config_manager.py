@@ -91,6 +91,25 @@ def save_brief_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+def get_vad_silence_timeout_ms() -> int:
+    """Return the VAD silence timeout in milliseconds.
+    Default: 60000ms (60 seconds) - allows long JARVIS responses without cutoff.
+    """
+    return load_api_keys().get("vad_silence_timeout_ms", 60000)
+
+
+def save_vad_silence_timeout_ms(timeout_ms: int) -> None:
+    """Persist the VAD silence timeout to config."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["vad_silence_timeout_ms"] = int(timeout_ms)
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
 def get_user_email() -> str:
     """Return the configured user email for Gmail API."""
     return load_api_keys().get("user_email", "")

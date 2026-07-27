@@ -57,6 +57,7 @@ from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.web_search        import _news as _fetch_news_sync
+from memory.config_manager     import get_brief_enabled, get_vad_silence_timeout_ms
 from actions.email             import email_action
 from memory.config_manager     import get_brief_enabled
 
@@ -439,7 +440,7 @@ TOOL_DECLARATIONS = [
         "Processes any file that the user has uploaded or dropped onto the interface. "
         "Use this when the user refers to an uploaded file and wants an action on it. "
         "Supports: images (describe/ocr/resize/compress/convert), "
-        "PDFs (summarize/extract_text/to_word), "
+        "PDFs (summarize/extract_text/to_word/summarize_images/extract_images), "
         "Word docs & text files (summarize/fix/reformat/translate), "
         "CSV/Excel (analyze/stats/filter/sort/convert), "
         "JSON/XML (validate/format/analyze), "
@@ -463,7 +464,7 @@ TOOL_DECLARATIONS = [
                 "description": (
                     "What to do with the file. Examples by type:\n"
                     "image: describe | ocr | resize | compress | convert | info\n"
-                    "pdf: summarize | extract_text | to_word | info\n"
+                    "pdf: summarize | extract_text | to_word | info | summarize_images | extract_images\n"
                     "docx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
                     "csv/excel: analyze | stats | filter | sort | convert | info\n"
                     "json: validate | format | analyze | to_csv\n"
@@ -495,6 +496,7 @@ TOOL_DECLARATIONS = [
             "ascending": {"type": "BOOLEAN", "description": "Sort order for CSV sort (default: true)"},
             "save":      {"type": "BOOLEAN", "description": "Save result to file (default: true)"},
             "destination": {"type": "STRING", "description": "Output folder for archive extract"},
+            "max_images": {"type": "INTEGER", "description": "Max embedded images to pull from a PDF for summarize_images/extract_images (default: 20)"},
         },
         "required": []
     }
@@ -762,6 +764,10 @@ class JarvisLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
+        # Increase VAD silence timeout so Jarvis doesn't stop speaking too early.
+        # Default server-side is ~2-3 seconds; use config value (default 15000 ms = 15 seconds) for longer responses.
+        vad_silence_ms = get_vad_silence_timeout_ms()
+
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -775,6 +781,18 @@ class JarvisLive:
                         voice_name="Charon"
                     )
                 )
+            ),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    silence_duration_ms=vad_silence_ms,
+                    # Hard cap on how long the model can speak per turn.
+                    # Without this, the server may default to a short limit.
+                    max_speaking_duration_ms=vad_silence_ms,
+                )
+            ),
+            # Allow longer responses by increasing max output tokens (default may be low).
+            generation_config=types.GenerationConfig(
+                max_output_tokens=8192
             ),
         )
 
